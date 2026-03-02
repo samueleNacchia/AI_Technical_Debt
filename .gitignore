@@ -1,0 +1,11 @@
+# Impostazioni di PyCharm
+.idea/
+
+# Cartella dell'ambiente virtuale (importantissimo!)
+venv/
+.venv/
+ENV/
+
+# File compilati di Python
+**/__pycache__/
+*.py[cod]
