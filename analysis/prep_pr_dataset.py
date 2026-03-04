@@ -9,32 +9,41 @@ from scipy import stats
 
 
 def process_dataset(type_path, meta_path, is_human=False):
-    # 1. Caricamento
+
+    # 1. Caricamento e integrazione dei dati base
     df_type = pd.read_parquet(type_path)
     df_meta = pd.read_parquet(meta_path)
+    df = pd.merge(df_type, df_meta, on='id', how='inner', suffixes=('', '_y'))
 
-    # 2. Merge
-    df = pd.merge(df_type, df_meta, on='id', how='left', suffixes=('', '_y'))
+    # 2. Logica di filtraggio per lo strato AI
+    if not is_human:
+        # Verifica della 'massa tecnica': inclusione solo di PR con modifiche file
+        commit_path = "hf://datasets/hao-li/AIDev/pr_commit_details.parquet"
+        df_commits = pd.read_parquet(commit_path, columns=['pr_id'])
+        valid_pr_ids = df_commits['pr_id'].unique()
 
-    # 3. Pulizia colonne iniziali
-    cols_to_ignore_early = ['title', 'body', 'reason', 'repo_url']
-    df.drop(columns=[c for c in cols_to_ignore_early if c in df.columns], inplace=True)
-    df.drop(columns=[c for c in df.columns if c.endswith('_y')], inplace=True)
+        # Selezione dei record con evidenza di contribuzione strutturale
+        df = df[df['id'].isin(valid_pr_ids)].copy()
 
-    # 4. Gestione colonna AGENT
-    if is_human:
+        # Filtro di qualità: soglia minima di confidenza (Confidence >= 9)
+        if 'confidence' in df.columns:
+            df = df[df['confidence'] >= 9].copy()
+    else:
+        # Etichettatura del gruppo di controllo umano
         df['agent'] = 'Human'
 
-    # 5. Filtro Confidence (solo per Agenti)
-    if not is_human and 'confidence' in df.columns:
-        df = df[df['confidence'] >= 9].copy()
+    # 3. Pulizia e standardizzazione del dataset
+    # Rimozione di metadati non rilevanti ai fini del calcolo delle metriche
+    cols_to_drop = ['title', 'body', 'reason', 'repo_url']
+    df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
+    df.drop(columns=[c for c in df.columns if c.endswith('_y')], inplace=True)
 
-    # 6. FILTRO 'OTHER' e 'REVERT'
+    # Selezione delle tipologie di task correlate allo sviluppo produttivo
     if 'type' in df.columns:
-        df = df[df['type'] != 'other'].copy()
-        df = df[df['type'] != 'revert'].copy()
+        # Esclusione di 'other' e 'revert' per minimizzare il rumore statistico
+        df = df[~df['type'].isin(['other', 'revert'])].copy()
 
-
+    # Finalizzazione del dataframe
     if 'confidence' in df.columns:
         df.drop(columns=['confidence'], inplace=True)
 
@@ -145,15 +154,13 @@ if __name__ == "__main__":
         print("=" * 30)
 
         # Salvataggio
-        output_dir = Path("dataset")
-        output_dir.mkdir(exist_ok=True)
-        all_pr_with_type.to_csv(output_dir / "all_pr_type.csv", index=False, encoding='utf-8-sig')
+        all_pr_with_type.to_csv("dataset/all_pr_type.csv", index=False)
 
-        df_studio, n_campioni = get_robust_sample(all_pr_with_type, target_moe=0.03, confidence_level=0.98, min_per_stratum=20)
+        df_studio, n_campioni = get_robust_sample(all_pr_with_type, target_moe=0.02, confidence_level=0.95, min_per_stratum=20)
 
         dist_counts = analyze_distributions(df_studio)
 
-        # Salvataggio del dataset definitivo per l'analisi del Debito Tecnico
+        # Salvataggio del dataset definitivo
         df_studio.to_csv("dataset/pr_study_sample.csv", index=False)
 
     except Exception as e:
