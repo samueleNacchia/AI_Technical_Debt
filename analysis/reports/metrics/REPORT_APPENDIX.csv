@@ -1,0 +1,6 @@
+type,agent,Rating,GRS,CDI,SCR,ASR,SFI,ACE,ASI,PCD,sample
+test,Claude_Code,A-EXCELLENT,0.8,0.61,0.0,0.3,0.01,0.07,0.38,78.14,6
+build,Claude_Code,B-GOOD,0.64,1.43,0.0,0.64,0.0,0.94,0.5,30.0,7
+perf,Claude_Code,D-RISKY,0.5,2.52,0.0,0.23,0.0,0.48,1.0,79.5,3
+style,Copilot,E-CRITICAL,0.45,1.46,0.25,0.16,0.6,0.69,0.8,22.75,8
+ci,Claude_Code,E-CRITICAL,0.45,3.1,0.0,0.66,0.0,0.71,0.78,5.22,5

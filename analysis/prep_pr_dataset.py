@@ -1,136 +1,196 @@
-from __future__ import annotations
-
+import os
 from pathlib import Path
-import pandas as pd
+from typing import Tuple
+
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
+import pandas as pd
+import seaborn as sns
 from scipy import stats
 
 
-def process_dataset(type_path, meta_path, is_human=False):
+# --- UTILS ---
 
-    # 1. Caricamento e integrazione dei dati base
-    df_type = pd.read_parquet(type_path)
+def clean_id(series: pd.Series) -> pd.Series:
+    """Standardizza gli ID rimuovendo decimali e spazi."""
+    return series.astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+
+
+def extract_repo_id(df: pd.DataFrame) -> pd.Series:
+    """Estrae il path 'owner/repo' dagli URL di GitHub."""
+    if 'repo_url' in df.columns:
+        return df['repo_url'].str.replace('https://github.com/', '', regex=False).str.strip('/')
+    elif 'html_url' in df.columns:
+        return df['html_url'].str.extract(r'github\.com/([^/]+/[^/]+)')[0]
+    return pd.Series("unknown_repository", index=df.index)
+
+
+# --- CORE LOGIC ---
+
+def process_dataset(type_path: str, meta_path: str, is_human: bool = False,
+                    human_metrics_path: str = "human_pr_commit_details.csv") -> pd.DataFrame:
+    """
+    Carica, pulisce e integra i dati delle Pull Request.
+    """
+    tag = "HUMAN" if is_human else "AI-AGENT"
+    print(f"--- Processamento dataset: [{tag}] ---")
+
+    # 1. Caricamento e Join Iniziale
+    df_type = pd.read_parquet(type_path).rename(columns={'pr_id': 'id'})
     df_meta = pd.read_parquet(meta_path)
-    df = pd.merge(df_type, df_meta, on='id', how='inner', suffixes=('', '_y'))
 
-    # 2. Logica di filtraggio per lo strato AI
+    df_type['id'] = clean_id(df_type['id'])
+    df_meta['id'] = clean_id(df_meta['id'])
+
+    # Evitiamo duplicati di colonne prima del merge
+    cols_to_drop = {'additions', 'deletions', 'changed_files', 'dir_count',
+                    'comments', 'review_comments', 'n_comments', 'agent'}
+    df_meta = df_meta.drop(columns=[c for c in cols_to_drop if c in df_meta.columns])
+
+    df = pd.merge(df_type, df_meta, on='id', how='inner')
+
+    # 2. Identificazione Repository
+    if 'repo_id' not in df.columns or df['repo_id'].isna().all():
+        df['repo_id'] = extract_repo_id(df)
+
+    # 3. Arricchimento Dati (AI vs Human)
     if not is_human:
-        # Verifica della 'massa tecnica': inclusione solo di PR con modifiche file
+        # Statistiche Commit AI
         commit_path = "hf://datasets/hao-li/AIDev/pr_commit_details.parquet"
-        df_commits = pd.read_parquet(commit_path, columns=['pr_id'])
-        valid_pr_ids = df_commits['pr_id'].unique()
+        try:
+            df_det = pd.read_parquet(commit_path, columns=['pr_id', 'additions', 'deletions', 'filename'])
+            df_det['pr_id'] = clean_id(df_det['pr_id'])
 
-        # Selezione dei record con evidenza di contribuzione strutturale
-        df = df[df['id'].isin(valid_pr_ids)].copy()
+            # Calcolo directory e file unici
+            df_det['directory'] = df_det['filename'].apply(lambda x: os.path.dirname(str(x)) if pd.notnull(x) else "")
 
-        # Filtro di qualità: soglia minima di confidenza (Confidence >= 9)
-        if 'confidence' in df.columns:
-            df = df[df['confidence'] >= 9].copy()
+            pr_stats = df_det.groupby('pr_id').agg({
+                'additions': 'sum',
+                'deletions': 'sum',
+                'filename': 'nunique',
+                'directory': 'nunique'
+            }).rename(columns={'filename': 'changed_files', 'directory': 'dir_count'}).reset_index()
+
+            df = pd.merge(df, pr_stats, left_on='id', right_on='pr_id', how='inner')
+        except Exception as e:
+            print(f" [!] Errore dettagli commit AI: {e}")
+
+        # Commenti AI
+        try:
+            comm_path = "hf://datasets/hao-li/AIDev/pr_comments.parquet"
+            df_comm = pd.read_parquet(comm_path, columns=['pr_id'])
+            df_comm['pr_id'] = clean_id(df_comm['pr_id'])
+            comm_stats = df_comm.groupby('pr_id').size().reset_index(name='n_comments')
+            df = pd.merge(df, comm_stats, left_on='id', right_on='pr_id', how='left')
+        except Exception as e:
+            print(f" [!] Errore commenti AI: {e}")
     else:
-        # Etichettatura del gruppo di controllo umano
-        df['agent'] = 'Human'
+        # Metriche Umane da CSV esterno
+        if Path(human_metrics_path).exists():
+            df_hu_metrics = pd.read_csv(human_metrics_path)
+            df_hu_metrics['id'] = clean_id(df_hu_metrics['id'])
+            # Teniamo solo colonne numeriche utili o non presenti
+            cols_to_keep = ['id', 'additions', 'deletions', 'changed_files', 'dir_count', 'n_comments']
+            df = pd.merge(df, df_hu_metrics[[c for c in cols_to_keep if c in df_hu_metrics.columns]], on='id',
+                          how='left')
+        else:
+            print(f" [!] File metriche umane non trovato in: {human_metrics_path}")
 
-    # 3. Pulizia e standardizzazione del dataset
-    # Rimozione di metadati non rilevanti ai fini del calcolo delle metriche
-    cols_to_drop = ['title', 'body', 'reason', 'repo_url']
-    df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
-    df.drop(columns=[c for c in df.columns if c.endswith('_y')], inplace=True)
+    # 4. Pulizia e Filtri Strategici
+    df['n_comments'] = df['n_comments'].fillna(0).astype(int)
+    df['dir_count'] = df['dir_count'].replace(0, 1).fillna(1)
 
-    # Selezione delle tipologie di task correlate allo sviluppo produttivo
-    if 'type' in df.columns:
-        # Esclusione di 'other' e 'revert' per minimizzare il rumore statistico
-        df = df[~df['type'].isin(['other', 'revert'])].copy()
+    # Filtro: Solo PR con contenuto
+    if 'additions' in df.columns:
+        df = df[(df['additions'] + df['deletions']) > 0].copy()
 
-    # Finalizzazione del dataframe
-    if 'confidence' in df.columns:
-        df.drop(columns=['confidence'], inplace=True)
+    # Filtro: Confidenza (Solo AI) e tipi non rilevanti
+    if not is_human and 'confidence' in df.columns:
+        df = df[df['confidence'] >= 9]
 
+    df = df[~df['type'].isin(['other', 'revert'])].copy()
+
+    # Uniformiamo la colonna 'agent' (usa agent_x se presente dal merge, altrimenti assegna manuale)
+    if 'agent_x' in df.columns:
+        df = df.rename(columns={'agent_x': 'agent'})
+    elif 'agent' not in df.columns:
+        df['agent'] = tag
+
+    # Drop colonne di servizio finali
+    final_keep = ['id', 'number', 'repo_id', 'agent', 'type', 'additions', 'deletions', 'changed_files', 'dir_count',
+                  'n_comments', 'created_at', 'merged_at', 'html_url']
+    df = df[[c for c in final_keep if c in df.columns]]
+
+    print(f" [+] PR totali elaborate: {len(df)}")
     return df
 
 
-def analyze_distributions(df, output_name="pr_sample_distribution.png"):
-    # 1. Creazione cartella figs se non esiste
-    output_dir = Path("figs")
+def analyze_distributions(df: pd.DataFrame, output_name: str):
+    """Genera e salva una heatmap della distribuzione dei dati."""
+    output_dir = Path("../figs")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nGenerazione Matrice e salvataggio in {output_dir}/{output_name}...")
-
-    # 2. Creazione della tabella di contingenza
     distribution = pd.crosstab(df['agent'], df['type'])
 
-    # 3. Creazione della Matrice Grafica
-    plt.figure(figsize=(14, 8))
-    sns.heatmap(distribution, annot=True, fmt='d', cmap='YlGnBu', linewidths=.5)
+    plt.figure(figsize=(12, 6))
+    sns.heatmap(distribution, annot=True, fmt='d', cmap='Blues', cbar_kws={'label': 'Numero di PR'})
 
-    plt.title('Matrice di Distribuzione PR: Conteggi per Agente e Tipo', fontsize=16, pad=20)
-    plt.ylabel('Agente / Origine', fontsize=12)
-    plt.xlabel('Tipo di Pull Request', fontsize=12)
-
-    plt.xticks(rotation=45)
-    plt.yticks(rotation=0)
+    plt.title('Distribuzione Tipologie Pull Request per Agente', fontsize=14, fontweight='bold')
+    plt.xlabel('Tipo Task', fontsize=12)
+    plt.ylabel('Soggetto', fontsize=12)
     plt.tight_layout()
 
-    # --- MODIFICA QUI: Salva invece di mostrare ---
     save_path = output_dir / output_name
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()  # Chiude la figura per liberare memoria
-
-    print(f"Immagine salvata correttamente.")
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f" [OK] Matrice salvata in: {save_path}")
     return distribution
 
 
-def get_robust_sample(df, target_moe, confidence_level, min_per_stratum):
+def get_robust_sample(df: pd.DataFrame, target_moe: float = 0.05,
+                      confidence_level: float = 0.95, min_per_stratum: int = 20) -> Tuple[pd.DataFrame, int]:
     N = len(df)
+    z = stats.norm.ppf(1 - (1 - confidence_level) / 2)
+    p = 0.5
+    num = (z ** 2 * p * (1 - p)) / (target_moe ** 2)
+    n_required = int(np.ceil(num / (1 + (num - 1) / N)))
 
-    alpha = 1 - confidence_level
-    # Calcoliamo lo Z-score esatto
-    z = stats.norm.ppf(1 - alpha / 2)
+    print(f"\n--- Analisi Statistica Campionamento ---")
+    print(f" Target MoE: {target_moe:.1%} | N richiesto: {n_required}")
 
-    p = 0.5  # Massima variabilità per un calcolo conservativo
+    # 1. Stratificazione: estraiamo solo gli INDICI delle righe
+    strata = df.groupby(['agent', 'type'], group_keys=False)
 
-    # 1. Calcolo dimensione del campione (n) con correzione per popolazione finita
-    numerator = (z ** 2 * p * (1 - p)) / (target_moe ** 2)
-    n_required = int(np.ceil(numerator / (1 + (numerator - 1) / N)))
+    # Estraiamo gli indici riga per lo strato minimo
+    sampled_indices = strata.apply(
+        lambda x: x.sample(n=min(len(x), min_per_stratum), random_state=42).index.to_series(),
+        include_groups=False
+    ).values
 
-    print(f"Analisi popolazione di {N} PR...")
-    print(f"Obiettivo scientifico: Confidenza {confidence_level:.0%}, Errore {target_moe:.0%}")
-    print(f"Campioni necessari calcolati: {n_required}")
+    # Flatten della lista di indici (nel caso apply restituisca una serie di liste)
+    if len(sampled_indices) > 0 and isinstance(sampled_indices[0], (pd.Series, list, np.ndarray)):
+        sampled_indices = np.concatenate(sampled_indices)
 
-    # 2. Base Stratificata Obbligatoria (Minimo 10 o tutto ciò che c'è)
-    strata = df.groupby(['agent', 'type'])
-    sample_indices = []
+    # Creiamo il primo blocco usando gli indici trovati
+    df_min = df.loc[sampled_indices].copy()
 
-    for _, group in strata:
-        n_to_take = min(len(group), min_per_stratum)
-        sample_indices.extend(group.sample(n=n_to_take, random_state=42).index)
-
-    df_min = df.loc[sample_indices]
-
-    # 3. Completamento fino al numero richiesto (n_required)
+    # 2. Riempimento: aggiungiamo PR casuali dal resto del dataset
     remaining_n = n_required - len(df_min)
     if remaining_n > 0:
         pool = df.drop(df_min.index)
-        extra = pool.sample(n=remaining_n, random_state=42)
-        df_final = pd.concat([df_min, extra])
+        extra = pool.sample(n=min(len(pool), remaining_n), random_state=42)
+        df_final = pd.concat([df_min, extra], ignore_index=True)
     else:
-        # Se i minimi superano già il n richiesto, teniamo i minimi
-        df_final = df_min
+        df_final = df_min.reset_index(drop=True)
 
-    # --- VALIDAZIONE STATISTICA FINALE ---
     n_final = len(df_final)
-    # Calcolo MoE reale ottenuto
-    moe_real = z * np.sqrt((0.25 / n_final) * (N - n_final) / (N - 1))
+    moe_real = z * np.sqrt((0.25 / n_final) * (N - n_final) / (N - 1)) if N > 1 else 0
+    print(f" Risultato: {n_final} PR (MoE Reale: {moe_real:.2%})")
 
-    print("\n" + "=" * 40)
-    print(f"CAMPIONE ESTRATTO: {n_final} PR")
-    print(f"Margine d'Errore Reale: {moe_real:.2%}")
-    print(f"Confidenza Effettiva: {confidence_level:.0%}")
-    print("=" * 40)
-
-    # Ritorna sia il dataframe che il numero totale di campioni
     return df_final, n_final
+
+
+# --- MAIN ---
 
 if __name__ == "__main__":
     paths = {
@@ -141,28 +201,30 @@ if __name__ == "__main__":
     }
 
     try:
-        # Elaborazione
+        # Processamento
         df_agents = process_dataset(paths["agent_type"], paths["agent_meta"], is_human=False)
-        df_human = process_dataset(paths["human_type"], paths["human_meta"], is_human=True)
+        df_human = process_dataset(paths["human_type"], paths["human_meta"],
+                                   is_human=True, human_metrics_path=r"reports/metrics/human_pr_commit_details.csv")
 
-        # Unione
-        all_pr_with_type = pd.concat([df_agents, df_human], ignore_index=True)
+        # Unione e salvataggio dataset globale
+        all_pr = pd.concat([df_agents, df_human], ignore_index=True)
+        os.makedirs("dataset", exist_ok=True)
+        all_pr.to_csv("dataset/all_pr_type.csv", index=False)
 
-        print("\n" + "=" * 30)
-        print(f"CONTEGGIO FINALE: {len(all_pr_with_type)} righe")
-        print(f"Elenco colonne: {list(all_pr_with_type.columns)}")
-        print("=" * 30)
+        # Analisi Distribuzione Totale
+        analyze_distributions(all_pr, "all_pr_distribution.png")
 
-        # Salvataggio
-        all_pr_with_type.to_csv("dataset/all_pr_type.csv", index=False)
+        # Campionamento per studio qualitativo/approfondito
+        df_sample, _ = get_robust_sample(all_pr, target_moe=0.03, confidence_level=0.98, min_per_stratum=20)
 
-        df_studio, n_campioni = get_robust_sample(all_pr_with_type, target_moe=0.02, confidence_level=0.95, min_per_stratum=20)
+        # Analisi Distribuzione Campione
+        analyze_distributions(df_sample, "pr_sample_distribution.png")
+        df_sample.to_csv("dataset/pr_study_sample.csv", index=False)
 
-        dist_counts = analyze_distributions(df_studio)
-
-        # Salvataggio del dataset definitivo
-        df_studio.to_csv("dataset/pr_study_sample.csv", index=False)
+        print("\n[SUCCESS] Pipeline completata con successo.")
 
     except Exception as e:
-        print(f"Errore: {e}")
+        print(f"\n[ERROR] Errore critico durante l'esecuzione: {e}")
+        import traceback
+        traceback.print_exc()
 
