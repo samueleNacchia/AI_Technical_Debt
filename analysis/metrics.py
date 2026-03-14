@@ -67,7 +67,12 @@ def get_failed_pr_ids(df, join_keys, file_map, tolerance_hours=72):
     return candidates[candidates['has_overlap'] == True]['id_t'].unique()
 
 # --- 3. CORE ANALYTICS ---
-def finalize_report(df, grouping_cols):
+def finalize_report(df, grouping_cols, global_stats=None, return_raw=False):
+    """
+    Esegue l'aggregazione e il calcolo delle metriche di qualità.
+    Se return_raw=True, restituisce i valori di instabilità non normalizzati.
+    """
+    # Aggregazione iniziale
     res = df.groupby(grouping_cols).agg({
         'merged_at': lambda x: x.notna().mean(),
         'time_hrs': ['median', 'mean'],
@@ -80,44 +85,46 @@ def finalize_report(df, grouping_cols):
         'id': 'count'
     }).reset_index()
 
+    # Appiattimento colonne
     res.columns = grouping_cols + ['acc_rate', 't_med', 't_mean', 'SFI', 'ACE', 'ASI', 'PCD', 'f_med', 'f_avg', 'SCR', 'sample']
 
-    # 1. Indicatori Instabilità (Z-Score robusto)
-    res['i_struct'] = np.log1p(res['f_avg'] / (res['f_med'] + 0.001))
-    res['i_proc'] = np.log1p(res['t_mean'] / (res['t_med'] + 0.001))
+    # 1. Calcolo instabilità logaritmica (valori grezzi)
+    # Queste colonne servono per calcolare la media/std globale
+    res['i_struct_raw'] = np.log1p(res['f_avg'] / (res['f_med'] + 0.001))
+    res['i_proc_raw'] = np.log1p(res['t_mean'] / (res['t_med'] + 0.001))
 
+    # Se stiamo solo estraendo i riferimenti globali, ci fermiamo qui
+    if return_raw:
+        return res
+
+    # 2. Normalizzazione (Z-Score)
     for c in ['i_struct', 'i_proc']:
-        res[c] = (res[c] - res[c].mean()) / (res[c].std() + 1e-6)
+        raw_col = f"{c}_raw"
+        if global_stats and f"{c}_mean" in global_stats:
+            # ANCORAGGIO GLOBALE: usa parametri passati dall'esterno
+            mu = global_stats[f"{c}_mean"]
+            sigma = global_stats[f"{c}_std"]
+            res[c] = (res[raw_col] - mu) / (sigma + 1e-6)
+        else:
+            # NORMALIZZAZIONE LOCALE: usa i dati del gruppo corrente
+            res[c] = (res[raw_col] - res[raw_col].mean()) / (res[raw_col].std() + 1e-6)
 
-    # 2. Metriche Avanzate
+    # 3. Metriche Avanzate e Sintetiche
     res['CDI'] = np.sqrt(np.square(res['i_struct']) + np.square(res['i_proc']))
-    res['GRS'] = 1 / (1 + res['SCR'] * 2.5 + res['CDI'] * 0.4) # Peso aumentato a SCR
+    res['GRS'] = 1 / (1 + res['SCR'] * 2.5 + res['CDI'] * 0.4)
     res['ASR'] = (res['acc_rate'] * (1 - res['SCR'])) / (np.log1p(res['t_med']) + 1)
 
-    # 3. Rating
+    # 4. Rating System
     def get_rating(row):
-        # CRITICAL: Fallimento alto o caos strutturale
-        if row['SCR'] > 0.18 or row['CDI'] > 2.8:
-            return 'E-CRITICAL'
-
-        # EXCELLENT: Elite performance
-        if row['GRS'] > 0.75 and row['SCR'] < 0.07 and row['CDI'] < 1.1:
-            return 'A-EXCELLENT'
-
-        # GOOD: Affidabile e solido
-        if row['GRS'] > 0.60 and row['SCR'] < 0.12 and row['CDI'] < 1.6:
-            return 'B-GOOD'
-
-        # AVERAGE: Accettabile ma migliorabile
-        if row['GRS'] > 0.45 and row['CDI'] < 2.2:
-            return 'C-AVERAGE'
-
-        # RISKY: Instabile o tendente all'errore
+        if row['SCR'] > 0.18 or row['CDI'] > 2.8: return 'E-CRITICAL'
+        if row['GRS'] > 0.75 and row['SCR'] < 0.07 and row['CDI'] < 1.1: return 'A-EXCELLENT'
+        if row['GRS'] > 0.60 and row['SCR'] < 0.12 and row['CDI'] < 1.6: return 'B-GOOD'
+        if row['GRS'] > 0.45 and row['CDI'] < 2.2: return 'C-AVERAGE'
         return 'D-RISKY'
 
     res['Rating'] = res.apply(get_rating, axis=1)
 
-    final_cols = grouping_cols + ['Rating', 'GRS', 'CDI', 'SCR', 'ASR', 'SFI', 'ACE', 'ASI', 'PCD', 'sample']
+    final_cols = grouping_cols + ['Rating', 'GRS', 'CDI', 'SCR', 'ASR', 'SFI', 'ACE', 'ASI', 'PCD', 'sample', 'acc_rate', 't_med']
     return res[final_cols].sort_values(by='GRS', ascending=False).round(2)
 
 # --- 4. VISUALIZZAZIONE ---
@@ -188,9 +195,20 @@ def main():
     df['PCD_pr'] = (df['additions'] + df['deletions']) / f_safe
     df['SFI_pr'] = df.get('n_comments', 0) / f_safe
 
+    # --- 3. CALCOLO RIFERIMENTI GLOBALI ---
+    # Chiamiamo finalize_report senza global_stats per ottenere i valori medi del dataset
+    full_view = finalize_report(df, ['agent', 'type'], return_raw=True)
+
+    stats_rif = {
+        'i_struct_mean': full_view['i_struct_raw'].mean(),
+        'i_struct_std': full_view['i_struct_raw'].std(),
+        'i_proc_mean': full_view['i_proc_raw'].mean(),
+        'i_proc_std': full_view['i_proc_raw'].std()
+    }
+
     # 3. Report Agenti con Baseline Umana fissa in cima
     print("📊 Generazione Report...")
-    agent_report = finalize_report(df, ['agent'])
+    agent_report = finalize_report(df, ['agent'], global_stats=stats_rif)
 
     # Identificazione e rinomina Human
     is_human = agent_report['agent'].str.contains('human', case=False)
@@ -207,9 +225,17 @@ def main():
     save_comparison_plot(final_agent_report, FIGS_DIR / "GRS_COMPARISON.png")
 
     # 4. Global & Appendix
-    full_report = finalize_report(df, ['type', 'agent'])
+    full_report = finalize_report(df, ['type', 'agent'], global_stats=stats_rif)
     full_report[full_report['sample'] >= MIN_SAMPLE_SIZE].to_csv(REPORTS_DIR / "REPORT_GLOBAL.csv", index=False)
     full_report[full_report['sample'] < MIN_SAMPLE_SIZE].to_csv(REPORTS_DIR / "REPORT_APPENDIX.csv", index=False)
+
+    # Report Meso: Solo Umani (per tipo)
+    report_type_human = finalize_report(df[df['agent'] == 'Human'], ['type'], global_stats=stats_rif)
+    report_type_human.to_csv(REPORTS_DIR / "REPORT_TYPE_HUMAN.csv", index=False)
+
+    # Report Meso: Solo AI Aggregati (per tipo)
+    report_type_ai = finalize_report(df[df['agent'] != 'Human'], ['type'], global_stats=stats_rif)
+    report_type_ai.to_csv(REPORTS_DIR / "REPORT_TYPE_AI.csv", index=False)
 
     print(f"✅ Completato. Fallimenti SCR: {df['failed_scr'].sum()}. Grafico salvato.")
 
