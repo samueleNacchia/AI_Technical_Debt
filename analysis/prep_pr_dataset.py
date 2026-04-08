@@ -1,16 +1,11 @@
 import os
 from pathlib import Path
-from typing import Tuple
-
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy import stats
 
 
 # --- UTILS ---
-
 def clean_id(series: pd.Series) -> pd.Series:
     """Standardizza gli ID rimuovendo decimali e spazi."""
     return series.astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
@@ -26,7 +21,6 @@ def extract_repo_id(df: pd.DataFrame) -> pd.Series:
 
 
 # --- CORE LOGIC ---
-
 def process_dataset(type_path: str, meta_path: str, is_human: bool = False,
                     human_metrics_path: str = "human_pr_commit_details.csv") -> pd.DataFrame:
     """
@@ -147,51 +141,7 @@ def analyze_distributions(df: pd.DataFrame, output_name: str):
     return distribution
 
 
-def get_robust_sample(df: pd.DataFrame, target_moe: float = 0.05,
-                      confidence_level: float = 0.95, min_per_stratum: int = 20) -> Tuple[pd.DataFrame, int]:
-    N = len(df)
-    z = stats.norm.ppf(1 - (1 - confidence_level) / 2)
-    p = 0.5
-    num = (z ** 2 * p * (1 - p)) / (target_moe ** 2)
-    n_required = int(np.ceil(num / (1 + (num - 1) / N)))
-
-    print(f"\n--- Analisi Statistica Campionamento ---")
-    print(f" Target MoE: {target_moe:.1%} | N richiesto: {n_required}")
-
-    # 1. Stratificazione: estraiamo solo gli INDICI delle righe
-    strata = df.groupby(['agent', 'type'], group_keys=False)
-
-    # Estraiamo gli indici riga per lo strato minimo
-    sampled_indices = strata.apply(
-        lambda x: x.sample(n=min(len(x), min_per_stratum), random_state=42).index.to_series(),
-        include_groups=False
-    ).values
-
-    # Flatten della lista di indici (nel caso apply restituisca una serie di liste)
-    if len(sampled_indices) > 0 and isinstance(sampled_indices[0], (pd.Series, list, np.ndarray)):
-        sampled_indices = np.concatenate(sampled_indices)
-
-    # Creiamo il primo blocco usando gli indici trovati
-    df_min = df.loc[sampled_indices].copy()
-
-    # 2. Riempimento: aggiungiamo PR casuali dal resto del dataset
-    remaining_n = n_required - len(df_min)
-    if remaining_n > 0:
-        pool = df.drop(df_min.index)
-        extra = pool.sample(n=min(len(pool), remaining_n), random_state=42)
-        df_final = pd.concat([df_min, extra], ignore_index=True)
-    else:
-        df_final = df_min.reset_index(drop=True)
-
-    n_final = len(df_final)
-    moe_real = z * np.sqrt((0.25 / n_final) * (N - n_final) / (N - 1)) if N > 1 else 0
-    print(f" Risultato: {n_final} PR (MoE Reale: {moe_real:.2%})")
-
-    return df_final, n_final
-
-
 # --- MAIN ---
-
 if __name__ == "__main__":
     paths = {
         "agent_type": "hf://datasets/hao-li/AIDev/pr_task_type.parquet",
@@ -213,13 +163,6 @@ if __name__ == "__main__":
 
         # Analisi Distribuzione Totale
         analyze_distributions(all_pr, "all_pr_distribution.png")
-
-        # Campionamento per studio qualitativo/approfondito
-        df_sample, _ = get_robust_sample(all_pr, target_moe=0.03, confidence_level=0.98, min_per_stratum=20)
-
-        # Analisi Distribuzione Campione
-        analyze_distributions(df_sample, "pr_sample_distribution.png")
-        df_sample.to_csv("dataset/pr_study_sample.csv", index=False)
 
         print("\n[SUCCESS] Pipeline completata con successo.")
 

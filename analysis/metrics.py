@@ -82,11 +82,14 @@ def finalize_report(df, grouping_cols, global_stats=None, return_raw=False):
         'PCD_pr': 'median',
         'filename': ['median', 'mean'],
         'failed_scr': 'mean',
-        'id': 'count'
+        'id': 'count',
+        'n_comments': 'mean',
+        'additions': 'mean',
+        'deletions': 'mean'
     }).reset_index()
 
     # Appiattimento colonne
-    res.columns = grouping_cols + ['acc_rate', 't_med', 't_mean', 'SFI', 'ACE', 'ASI', 'PCD', 'f_med', 'f_avg', 'SCR', 'sample']
+    res.columns = grouping_cols + ['acc_rate', 't_med', 't_mean', 'SFI', 'ACE', 'ASI', 'PCD', 'f_med', 'f_avg', 'SCR', 'sample', 'avg_comments', 'avg_add', 'avg_del']
 
     # 1. Calcolo instabilità logaritmica (valori grezzi)
     # Queste colonne servono per calcolare la media/std globale
@@ -124,7 +127,7 @@ def finalize_report(df, grouping_cols, global_stats=None, return_raw=False):
 
     res['Rating'] = res.apply(get_rating, axis=1)
 
-    final_cols = grouping_cols + ['Rating', 'GRS', 'CDI', 'SCR', 'ASR', 'SFI', 'ACE', 'ASI', 'PCD', 'sample', 'acc_rate', 't_med']
+    final_cols = grouping_cols + ['Rating', 'GRS', 'CDI', 'SCR', 'ASR', 'SFI', 'ACE', 'ASI', 'PCD', 'sample', 'acc_rate', 't_med', 'avg_comments', 'f_avg', 'avg_add', 'avg_del']
     return res[final_cols].sort_values(by='GRS', ascending=False).round(2)
 
 # --- 4. VISUALIZZAZIONE ---
@@ -177,6 +180,9 @@ def main():
     df['id'] = df['id'].astype(str)
 
     # Pre-processing
+    df['n_comments'] = df.get('n_comments', 0).fillna(0)
+    df['additions'] = df.get('additions', 0).fillna(0)
+    df['deletions'] = df.get('deletions', 0).fillna(0)
     df['merged_at'] = pd.to_datetime(df['merged_at']).dt.tz_localize(None)
     df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None)
     df['time_hrs'] = (df['merged_at'] - df['created_at']).dt.total_seconds() / 3600
